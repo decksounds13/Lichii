@@ -420,7 +420,12 @@ TEST_CASE("Native accesses through a cbuf pointer or a pointer loaded from it bi
     static_cast<void>(program.record->LoadGlobal128(address));
 
     CHECK(program.fixture.TrackedOffsets() == std::vector<u32>{0x30, 0x30});
-    CHECK(program.fixture.program.info.native_global_bounds);
+    // Not program-wide closest-base: SPIR-V keeps an address the paired binding covers on that
+    // binding, and uses the loaded pointer only when its binding covers the whole access.
+    CHECK_FALSE(program.fixture.program.info.native_global_bounds);
+    const auto& descriptors{program.fixture.program.info.storage_buffers_descriptors};
+    CHECK(std::ranges::count_if(descriptors, [](const auto& desc) { return desc.paired_range; }) ==
+          2);
     CHECK(program.LoadedDescriptors() == 1);
     CHECK(program.Count(IR::Opcode::LoadStorage64) == 1);
     CHECK(program.Count(IR::Opcode::LoadGlobal128) == 1);

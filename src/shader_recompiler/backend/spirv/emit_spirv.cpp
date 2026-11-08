@@ -577,6 +577,33 @@ void PatchPhiNodes(IR::Program& program, EmitContext& ctx) {
             });
         }
 
+// Sirit cannot emit OpArrayLength. Each stand-in is OpIAdd(u32, ssbo, 0); the ssbo variable
+// stays the structure operand and the zero id becomes the member literal.
+void PatchArrayLengths(std::vector<u32>& code, std::span<const u32> result_ids) {
+    if (result_ids.empty()) {
+        return;
+    }
+    size_t found{};
+    size_t offset = 5;
+    while (offset + 4 < code.size()) {
+        const u32 word_count{code[offset] >> 16};
+        if (word_count == 0) {
+            break;
+        }
+        const auto opcode{static_cast<spv::Op>(code[offset] & 0xFFFFu)};
+        if (opcode == spv::Op::OpIAdd && word_count == 5 &&
+            std::ranges::find(result_ids, code[offset + 2]) != result_ids.end()) {
+            code[offset] = (5U << 16) | static_cast<u32>(spv::Op::OpArrayLength);
+            code[offset + 4] = 0;
+            ++found;
+        }
+        offset += word_count;
+    }
+    if (found != result_ids.size()) {
+        throw LogicError("Storage buffer length markers not found");
+    }
+}
+
 void RewriteOpcodes(std::vector<u32>& code, std::span<const std::pair<u32, spv::Op>> rewrites) {
     if (rewrites.empty()) {
         return;
@@ -661,6 +688,7 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
     PatchPhiNodes(program, ctx);
     std::vector<u32> code{ctx.Assemble()};
     RewriteOpcodes(code, ctx.opcode_rewrites);
+    PatchArrayLengths(code, ctx.array_length_ids);
     PatchMeshInstructions(code, ctx);
     return code;
 }

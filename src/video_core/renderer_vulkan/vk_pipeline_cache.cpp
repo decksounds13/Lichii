@@ -1168,10 +1168,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                      error ? fmt::format(" (failed: {})", error.message()) : std::string{});
         }
     }
-    // Version 53 caches are not imported. CopyCompatiblePipelineCache only rewrites the header,
-    // and those records freeze storage-pointer classification from the first translation.
-    // Relabeling one as version 54 would keep Ocarina's near-leaf reads on the paired binding.
-    // vulkan-frizti.fork-v52.bin and vulkan.fork-v53.bin stay on disk and are not opened.
+    // Version 53 and 54 caches are not imported. CopyCompatiblePipelineCache only rewrites the
+    // header. Version 53 freezes storage-pointer classification. Version 54's shaders send a
+    // paired read to whichever bound base is closest, which dropped records the paired buffer
+    // still covered. vulkan-frizti.fork-v52.bin, vulkan.fork-v53.bin and the fork-v54 files stay
+    // on disk and are not opened.
     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
     used_pipelines_saved = std::chrono::steady_clock::now();
     size_t skipped_pipelines = 0;

@@ -84,6 +84,8 @@ struct StorageInfo {
     bool bind_competing_loaded{true};
     /// A paired access bound the loaded pointers that compete with its pair.
     bool competing_loaded_bound{};
+    /// The paired pointer and the pointers loaded from it. They are range-checked on their own.
+    StorageBufferSet paired_range_bindings;
     /// Pointer table entries reached through a phi or select of table pointers, or through a
     /// table pointer read from a dynamically indexed constant buffer array. They are bound only
     /// in the bindings the program's other storage buffers leave free (table_budget).
@@ -1362,23 +1364,52 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         const auto& candidates{it->second};
         const bool has_loaded_pointer{std::ranges::any_of(
             candidates, [](const StorageBufferAddr& c) { return c.indirect != ~0U; })};
-        if (paired_found &&
-            (!has_loaded_pointer || !info.bind_competing_loaded || !IsRuntimeRoutable(inst))) {
-            // No pointer loaded from memory competes with the paired one, or the access cannot
-            // stay global: keep the pair.
-        } else if (candidates.size() > 1 || paired_found ||
-                   (!candidates.empty() && info.native_dynamic.contains(start))) {
+        // The paired binding keeps every address it covers. The loaded pointer is a second
+        // binding, used only when its own range covers the access. Other candidates stay out of
+        // this route, and the shader is not marked for program-wide closest-base because of it.
+        if (paired_found && has_loaded_pointer && info.bind_competing_loaded &&
+            IsRuntimeRoutable(inst)) {
+            bool accepted{};
+            const auto bind_paired = [&](const StorageBufferAddr& addr) {
+                info.set.insert(addr);
+                info.paired_range_bindings.insert(addr);
+                if (IsGlobalMemoryWrite(inst)) {
+                    info.writes.insert(addr);
+                }
+            };
+            for (const StorageBufferAddr& candidate : candidates) {
+                if (candidate.indirect == ~0U) {
+                    continue;
+                }
+                if (std::ranges::find(info.table_candidates, candidate) !=
+                    info.table_candidates.end()) {
+                    const StorageBufferAddr holder{.index = candidate.index,
+                                                   .offset = candidate.offset};
+                    const size_t added{(info.set.find(candidate) == info.set.end() ? 1U : 0U) +
+                                       (info.set.find(holder) == info.set.end() ? 1U : 0U)};
+                    if (info.table_used + added > info.table_budget) {
+                        continue;
+                    }
+                    info.table_used += added;
+                }
+                if (!accepted) {
+                    bind_paired(*storage_buffer);
+                    accepted = true;
+                }
+                bind_paired(candidate);
+                bind_paired(StorageBufferAddr{.index = candidate.index, .offset = candidate.offset});
+            }
+            if (accepted) {
+                info.competing_loaded_bound = true;
+                return;
+            }
+        }
+        if (!paired_found &&
+            (candidates.size() > 1 ||
+             (!candidates.empty() && info.native_dynamic.contains(start)))) {
             // Bind every candidate and keep the access global; the backend picks the buffer at
             // run time. Rebasing on one of them drops the other path's accesses.
             bool accepted{};
-            if (paired_found) {
-                // The paired pointer is the other input of the select or phi; bind it too.
-                info.competing_loaded_bound = true;
-                info.set.insert(*storage_buffer);
-                if (IsGlobalMemoryWrite(inst)) {
-                    info.writes.insert(*storage_buffer);
-                }
-            }
             for (const StorageBufferAddr& candidate : candidates) {
                 if (std::ranges::find(info.table_candidates, candidate) !=
                     info.table_candidates.end()) {
@@ -1653,6 +1684,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
             .count = 1,
             .is_written = info.writes.contains(storage_buffer),
             .indirect_offset = storage_buffer.indirect,
+            .paired_range = info.paired_range_bindings.contains(storage_buffer),
         });
     }
     for (const StorageInst& storage_inst : info.to_replace) {
@@ -1679,6 +1711,7 @@ void JoinStorageInfo(Info& base, Info& source) {
         })};
         if (it != descriptors.end()) {
             it->is_written |= desc.is_written;
+            it->paired_range |= desc.paired_range;
             continue;
         }
         descriptors.push_back(desc);

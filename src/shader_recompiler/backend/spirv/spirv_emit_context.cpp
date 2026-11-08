@@ -965,7 +965,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     using DefPtr = Id StorageDefinitions::*;
     const Id zero{u32_zero_value};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
-                               auto&& callback) {
+                               u32 access_bytes, auto&& callback) {
         AddLabel();
         const size_t num_buffers{info.storage_buffers_descriptors.size()};
         const u64 ssbo_align_mask{~(profile.min_ssbo_alignment - 1U)};
@@ -1014,13 +1014,59 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             callback(ssbo_pointer, ssbo_id, ssbo_index);
             AddLabel(else_label);
         }};
+        // OpArrayLength's result is an element count. The U32 view's stride is 4, so the bound
+        // byte length is that count times 4. Sirit has no OpArrayLength; the add is rewritten
+        // after assembly (PatchArrayLengths) and its second operand becomes the member literal.
+        const auto bound_bytes{[&](size_t index) {
+            const Id elements{OpIAdd(U32[1], ssbos[index].U32, u32_zero_value)};
+            array_length_ids.push_back(elements.value);
+            return OpIMul(U64, OpUConvert(U64, elements), Constant(U64, sizeof(u32)));
+        }};
+        // True when every byte of this access is inside the binding. A short binding must not
+        // take an address just because its base is closer, and a wide load must not start in
+        // range and run off the end.
+        const auto covers{[&](Id base, Id bytes) {
+            const Id width{Constant(U64, static_cast<u64>(access_bytes))};
+            const Id wide_enough{OpUGreaterThanEqual(U1, bytes, width)};
+            const Id end{OpISub(U64, bytes, width)};
+            const Id limit{OpSelect(U64, wide_enough, end, Constant(U64, 0))};
+            // addr < base wraps this subtract. The wrapped value does not fit the u32 index,
+            // so the access stays off this binding instead of truncating into it.
+            const Id offset{OpISub(U64, addr, base)};
+            const Id fits_index{OpULessThanEqual(U1, offset, Constant(U64, ~u64{0} >> 32))};
+            const Id in_binding{OpULessThanEqual(U1, offset, limit)};
+            return OpLogicalAnd(U1, wide_enough,
+                                OpLogicalAnd(U1, fits_index, in_binding));
+        }};
+        const auto try_paired{[&](bool loaded) {
+            for (size_t index = 0; index < num_buffers; ++index) {
+                const auto& ssbo{info.storage_buffers_descriptors[index]};
+                if (!ssbo.paired_range || (ssbo.indirect_offset != ~0U) != loaded) {
+                    continue;
+                }
+                const Id base{base_address(index)};
+                access(index, base, covers(base, bound_bytes(index)));
+            }
+        }};
+        const bool any_paired{std::ranges::any_of(info.storage_buffers_descriptors,
+                                                  [](const auto& ssbo) { return ssbo.paired_range; })};
+        if (any_paired) {
+            // The constant-buffer pointer first, so an address it still covers is not stolen by
+            // the loaded pointer or by any other storage buffer in the shader.
+            try_paired(false);
+            try_paired(true);
+        }
         if (info.native_global_bounds) {
             // Native pointers carry no NVN size word. The address belongs to the candidate buffer
             // whose base is the closest one at or below it (bounds come from the binding).
+            // Paired-range bindings were already accepted or rejected by their real length.
             std::vector<Id> bases(num_buffers);
             Id best_index{Const(~0U)};
             Id best_distance{Constant(U64, ~u64{0})};
             for (size_t index = 0; index < num_buffers; ++index) {
+                if (info.storage_buffers_descriptors[index].paired_range) {
+                    continue;
+                }
                 bases[index] = base_address(index);
                 const Id distance{OpISub(U64, addr, bases[index])};
                 const Id better{OpLogicalAnd(U1, OpUGreaterThanEqual(U1, addr, bases[index]),
@@ -1029,13 +1075,17 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
                 best_index = OpSelect(U32[1], better, Const(static_cast<u32>(index)), best_index);
             }
             for (size_t index = 0; index < num_buffers; ++index) {
+                if (info.storage_buffers_descriptors[index].paired_range) {
+                    continue;
+                }
                 access(index, bases[index],
                        OpIEqual(U1, best_index, Const(static_cast<u32>(index))));
             }
             return;
         }
         for (size_t index = 0; index < num_buffers; ++index) {
-            if (!UsesNvnStorageDescriptor(info, info.storage_buffers_descriptors[index])) {
+            if (info.storage_buffers_descriptors[index].paired_range ||
+                !UsesNvnStorageDescriptor(info, info.storage_buffers_descriptors[index])) {
                 continue;
             }
             const auto& ssbo{info.storage_buffers_descriptors[index]};
@@ -1072,6 +1122,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         if (shift > 2 && profile.min_ssbo_alignment < (1U << shift)) {
             const u32 count = 1U << (shift - 2);
             define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
+                        count * static_cast<u32>(sizeof(u32)),
                         [&](Id, Id ssbo_id, Id word_index) {
                             std::array<Id, 4> words;
                             for (u32 i = 0; i < count; ++i) {
@@ -1087,7 +1138,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             OpFunctionEnd();
             return func_id;
         }
-        define_body(ssbo_member, addr, element_pointer, shift,
+        define_body(ssbo_member, addr, element_pointer, shift, 1U << shift,
                     [&](Id ssbo_pointer, Id, Id) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
         OpReturnValue(ConstantNull(type));
         OpFunctionEnd();
@@ -1113,6 +1164,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         if (shift > 2 && profile.min_ssbo_alignment < (1U << shift)) {
             const u32 count = 1U << (shift - 2);
             define_body(&StorageDefinitions::U32, addr, storage_types.U32.element, 2,
+                        count * static_cast<u32>(sizeof(u32)),
                         [&](Id, Id ssbo_id, Id word_index) {
                             for (u32 i = 0; i < count; ++i) {
                                 const Id index{i == 0 ? word_index
@@ -1127,7 +1179,8 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             OpFunctionEnd();
             return func_id;
         }
-        define_body(ssbo_member, addr, element_pointer, shift, [&](Id ssbo_pointer, Id, Id) {
+        define_body(ssbo_member, addr, element_pointer, shift, 1U << shift,
+                    [&](Id ssbo_pointer, Id, Id) {
             OpStore(ssbo_pointer, data);
             OpReturn();
         });
@@ -1151,7 +1204,8 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         define(&StorageDefinitions::U32x4, storage_types.U32x4, U32[4], sizeof(u32[4]));
 
     if (!std::ranges::any_of(info.storage_buffers_descriptors, [&](const auto& descriptor) {
-            return info.native_global_bounds || UsesNvnStorageDescriptor(info, descriptor);
+            return info.native_global_bounds || descriptor.paired_range ||
+                   UsesNvnStorageDescriptor(info, descriptor);
         })) {
         return;
     }
@@ -1174,7 +1228,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const Id value{OpFunctionParameter(U32[1])};
         const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
         define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2,
-                    [&](Id pointer, Id, Id) {
+                    static_cast<u32>(sizeof(u32)), [&](Id pointer, Id, Id) {
                         OpReturnValue(opcode == IR::Opcode::GlobalAtomicIAdd32
                                           ? OpAtomicIAdd(U32[1], pointer, scope, u32_zero_value, value)
                                           : OpAtomicUMax(U32[1], pointer, scope, u32_zero_value, value));
@@ -1195,7 +1249,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const Id value{OpFunctionParameter(U32[1])};
         const Id scope{Const(static_cast<u32>(spv::Scope::Device))};
         define_body(&StorageDefinitions::U32, address, storage_types.U32.element, 2,
-                    [&](Id pointer, Id, Id) {
+                    static_cast<u32>(sizeof(u32)), [&](Id pointer, Id, Id) {
                         OpReturnValue(OpAtomicCompareExchange(U32[1], pointer, scope,
                                                               u32_zero_value, u32_zero_value,
                                                               value, comparator));

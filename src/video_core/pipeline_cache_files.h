@@ -13,11 +13,14 @@
 
 namespace VideoCommon {
 
-// 49 and 54: a native access can bind a pointer loaded from memory beside the constant
-// buffer pointer it was paired with. Older records freeze IsCbufStorageBufferPointer from
-// the first translation, so they are not loaded and a version-53 cache is not relabeled.
+// 49 and 55: a native access can bind a pointer loaded from memory beside the constant
+// buffer pointer it was paired with. The loaded pointer is used only when the paired
+// binding does not cover the access and the loaded binding does. Version 54 routed those
+// reads to the closest base. Older records freeze
+// IsCbufStorageBufferPointer from the first translation, so they are not loaded and a
+// version-53 or version-54 cache is not relabeled.
 inline constexpr u32 OpenGLPipelineCacheVersion = 49;
-inline constexpr u32 VulkanPipelineCacheVersion = 54;
+inline constexpr u32 VulkanPipelineCacheVersion = 55;
 
 // Official Eglantine (cache version 18 at c0cb3325) and this fork (a different version) both
 // used <shader dir>/<title>/vulkan.bin and vulkan_pipelines.bin. Each build deletes a file

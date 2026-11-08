@@ -371,6 +371,8 @@ public:
     std::array<Id, 2> software_matrix_functions{};
     std::vector<Id> interfaces;
     std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
+    /// Result ids of OpIAdd stand-ins rewritten to OpArrayLength of the U32 storage-buffer view.
+    std::vector<u32> array_length_ids;
 
     // Task and mesh programs. Their stage buffer: the task's output region is the task payload
     // (the mesh stage's input region); the mesh output regions live in workgroup memory until
